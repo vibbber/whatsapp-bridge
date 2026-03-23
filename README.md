@@ -22,9 +22,9 @@ The upstream MCP only searches contacts that have been synced into the local `ch
 
 WhatsApp has been transitioning some contacts to use LID-based JIDs instead of phone-number-based JIDs. This fork resolves LIDs to real contact names using whatsmeow's `lid_map` table, so chats and messages from LID-based contacts show proper names instead of opaque numeric IDs.
 
-### Accent-insensitive search
+### Accent- and case-insensitive search
 
-Searching for "Gotze" now finds "Götze", "Pinol" finds "Piñol", etc. All search operations normalize Unicode diacritics for comparison.
+Searching for "schroder" now finds "Schröder", "Munoz" finds "Muñoz", etc. All search operations normalize Unicode diacritics for comparison.
 
 ### On-demand chat sync
 
