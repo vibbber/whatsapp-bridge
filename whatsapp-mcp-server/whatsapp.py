@@ -1,4 +1,5 @@
 import sqlite3
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -7,8 +8,87 @@ import requests
 import json
 import audio
 
+
+def normalize_text(text: str) -> str:
+    """Strip accents/diacritics and lowercase for search comparison.
+    e.g. 'Götze' -> 'gotze', 'Piñol' -> 'pinol'
+    """
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.category(c).startswith('M')).lower()
+
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _get_whatsmeow_contacts() -> dict:
+    """Load all contacts from whatsmeow's contact store.
+    Returns dict mapping JID -> best available name.
+    Also resolves LID-based JIDs using the lid_map table.
+    """
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+
+        # Load LID -> phone number mapping
+        lid_to_pn = {}
+        try:
+            cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
+            for lid, pn in cursor.fetchall():
+                lid_to_pn[lid] = pn
+        except sqlite3.Error:
+            pass
+
+        # Load all contacts (both phone and LID based)
+        cursor.execute("""
+            SELECT their_jid, first_name, full_name, push_name, business_name
+            FROM whatsmeow_contacts
+        """)
+        contacts = {}
+        for row in cursor.fetchall():
+            jid, first_name, full_name, push_name, business_name = row
+            name = full_name or business_name or push_name or first_name or ""
+            if not name:
+                continue
+
+            if jid.endswith("@s.whatsapp.net"):
+                contacts[jid] = name
+            elif jid.endswith("@lid"):
+                # Store under LID JID so LID-based chats get resolved
+                contacts[jid] = name
+                # Also map to phone JID
+                lid_num = jid.split("@")[0]
+                if lid_num in lid_to_pn:
+                    phone_jid = lid_to_pn[lid_num] + "@s.whatsapp.net"
+                    if phone_jid not in contacts:
+                        contacts[phone_jid] = name
+        return contacts
+    except sqlite3.Error:
+        return {}
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def _get_lid_map() -> dict:
+    """Load LID -> phone number mapping from whatsmeow.
+    Returns dict mapping LID JID -> phone JID.
+    """
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
+        result = {}
+        for lid, pn in cursor.fetchall():
+            result[f"{lid}@lid"] = f"{pn}@s.whatsapp.net"
+        return result
+    except sqlite3.Error:
+        return {}
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 @dataclass
 class Message:
@@ -51,39 +131,82 @@ def get_sender_name(sender_jid: str) -> str:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
+
+        # First try matching by exact JID in chats table
         cursor.execute("""
             SELECT name
             FROM chats
             WHERE jid = ?
             LIMIT 1
         """, (sender_jid,))
-        
+
         result = cursor.fetchone()
-        
+
         # If no result, try looking for the number within JIDs
         if not result:
-            # Extract the phone number part if it's a JID
             if '@' in sender_jid:
                 phone_part = sender_jid.split('@')[0]
             else:
                 phone_part = sender_jid
-                
+
             cursor.execute("""
                 SELECT name
                 FROM chats
                 WHERE jid LIKE ?
                 LIMIT 1
             """, (f"%{phone_part}%",))
-            
+
             result = cursor.fetchone()
-        
-        if result and result[0]:
+
+        if result and result[0] and not result[0].isdigit():
             return result[0]
+
+        # Fall back to whatsmeow contacts (address book)
+        # Try multiple JID formats: exact, @s.whatsapp.net, @lid, and LID->phone mapping
+        if '@' in sender_jid:
+            jids_to_try = [sender_jid]
         else:
-            return sender_jid
-        
+            jids_to_try = [f"{sender_jid}@s.whatsapp.net", f"{sender_jid}@lid"]
+        try:
+            wconn = sqlite3.connect(WHATSMEOW_DB_PATH)
+            wcursor = wconn.cursor()
+            for jid_to_lookup in jids_to_try:
+                wcursor.execute("""
+                    SELECT full_name, push_name, business_name, first_name
+                    FROM whatsmeow_contacts
+                    WHERE their_jid = ?
+                    LIMIT 1
+                """, (jid_to_lookup,))
+                wresult = wcursor.fetchone()
+                if wresult:
+                    name = wresult[0] or wresult[1] or wresult[2] or wresult[3]
+                    if name:
+                        return name
+            # Also try LID map: if sender is a LID, resolve to phone and look up contact
+            lid_num = sender_jid.split("@")[0] if "@" in sender_jid else sender_jid
+            wcursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ? LIMIT 1", (lid_num,))
+            lid_result = wcursor.fetchone()
+            if lid_result:
+                phone_jid = lid_result[0] + "@s.whatsapp.net"
+                wcursor.execute("""
+                    SELECT full_name, push_name, business_name, first_name
+                    FROM whatsmeow_contacts
+                    WHERE their_jid = ?
+                    LIMIT 1
+                """, (phone_jid,))
+                wresult = wcursor.fetchone()
+                if wresult:
+                    name = wresult[0] or wresult[1] or wresult[2] or wresult[3]
+                    if name:
+                        return name
+        except sqlite3.Error:
+            pass
+        finally:
+            if 'wconn' in locals():
+                wconn.close()
+
+        return sender_jid
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -346,42 +469,60 @@ def list_chats(
                 AND chats.last_message_time = messages.timestamp
             """)
             
-        where_clauses = []
         params = []
-        
-        if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
-            
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
+        # Load whatsmeow contacts for name enrichment (always, to resolve LID names)
+        whatsmeow_contacts = _get_whatsmeow_contacts()
+        lid_map = _get_lid_map()
+
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
-        # Add pagination
-        offset = (page ) * limit
-        query_parts.append("LIMIT ? OFFSET ?")
-        params.extend([limit, offset])
-        
-        cursor.execute(" ".join(query_parts), tuple(params))
-        chats = cursor.fetchall()
-        
+
+        if query:
+            # Fetch all chats and filter in Python for accent-insensitive multi-word matching
+            cursor.execute(" ".join(query_parts), tuple(params))
+            all_chats = cursor.fetchall()
+
+            query_words = normalize_text(query).split()
+            filtered = []
+            for chat_data in all_chats:
+                jid = chat_data[0]
+                # Enrich name from whatsmeow contacts (handles both phone and LID JIDs)
+                name = whatsmeow_contacts.get(jid) or chat_data[1] or ""
+                # For LID chats, also include the mapped phone number in search
+                phone_jid = lid_map.get(jid, "")
+                searchable = normalize_text(name) + " " + jid.lower() + " " + phone_jid.lower()
+                if all(word in searchable for word in query_words):
+                    chat_data = (chat_data[0], name) + chat_data[2:]
+                    filtered.append(chat_data)
+
+            offset = page * limit
+            chats = filtered[offset:offset + limit]
+        else:
+            offset = page * limit
+            query_parts.append("LIMIT ? OFFSET ?")
+            params.extend([limit, offset])
+            cursor.execute(" ".join(query_parts), tuple(params))
+            chats = cursor.fetchall()
+
         result = []
         for chat_data in chats:
+            jid = chat_data[0]
+            # Enrich name from whatsmeow contacts (especially for LID-based chats)
+            name = whatsmeow_contacts.get(jid) or chat_data[1] or jid
             chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
+                jid=jid,
+                name=name,
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -391,37 +532,55 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Searches both the chats table (synced conversations) and whatsmeow's
+    full contact store (phone address book). Supports accent-insensitive
+    and multi-word matching.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        # Fetch all non-group contacts from chats table
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
+            SELECT DISTINCT jid, name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
+            WHERE jid NOT LIKE '%@g.us'
+        """)
+        chat_contacts = {row[0]: row[1] for row in cursor.fetchall()}
+
+        # Merge with whatsmeow contacts (address book)
+        whatsmeow_contacts = _get_whatsmeow_contacts()
+
+        # Build merged contact list: whatsmeow name takes priority since
+        # chats table may have stale names or just phone numbers
+        all_contacts = {}
+        for jid, name in chat_contacts.items():
+            all_contacts[jid] = whatsmeow_contacts.get(jid) or name or ""
+        for jid, name in whatsmeow_contacts.items():
+            if jid not in all_contacts:
+                all_contacts[jid] = name
+
+        # Normalize query words for accent-insensitive matching
+        query_words = normalize_text(query).split()
+
         result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
+        for jid, name in sorted(all_contacts.items(), key=lambda x: x[1] or x[0]):
+            name_normalized = normalize_text(name)
+            jid_lower = jid.lower()
+            searchable = name_normalized + " " + jid_lower
+
+            if all(word in searchable for word in query_words):
+                result.append(Contact(
+                    phone_number=jid.split('@')[0],
+                    name=name,
+                    jid=jid
+                ))
+
+            if len(result) >= 50:
+                break
+
         return result
         
     except sqlite3.Error as e:

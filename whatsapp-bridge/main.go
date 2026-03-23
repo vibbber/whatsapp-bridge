@@ -774,6 +774,54 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for triggering on-demand history sync for a specific chat
+	http.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
+			// No specific chat - request general sync
+			requestHistorySync(client, messageStore)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "General history sync requested.",
+			})
+			return
+		}
+
+		// Request on-demand sync for a specific chat
+		err := requestChatSync(client, messageStore, req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to sync chat: %v", err),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("On-demand sync requested for %s. Messages will arrive shortly.", req.ChatJID),
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -905,6 +953,9 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Send presence to ensure WhatsApp knows we're online and pushes pending sync data
+	client.SendPresence(context.Background(), types.PresenceAvailable)
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -987,15 +1038,28 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Try contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		}
+
+		// If no name found and this is a LID, try resolving via LID map
+		if name == "" && jid.Server == "lid" {
+			phoneJID, resolveErr := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if resolveErr == nil && phoneJID.User != "" {
+				phoneContact, phoneErr := client.Store.Contacts.GetContact(context.Background(), phoneJID)
+				if phoneErr == nil && phoneContact.FullName != "" {
+					name = phoneContact.FullName
+				} else if phoneErr == nil && phoneContact.PushName != "" {
+					name = phoneContact.PushName
+				}
+			}
+		}
+
+		if name == "" && sender != "" {
 			name = sender
-		} else {
-			// Last fallback to JID
+		} else if name == "" {
 			name = jid.User
 		}
 
@@ -1148,39 +1212,118 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		fmt.Println("Cannot request history sync: client not ready")
 		return
 	}
 
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+	// Get the oldest message we have to request more history before it
+	var oldestID, oldestChatJID string
+	var oldestTimestamp time.Time
+	var oldestIsFromMe bool
+
+	err := messageStore.db.QueryRow(`
+		SELECT id, chat_jid, timestamp, is_from_me
+		FROM messages
+		ORDER BY timestamp ASC
+		LIMIT 1
+	`).Scan(&oldestID, &oldestChatJID, &oldestTimestamp, &oldestIsFromMe)
+
+	if err != nil {
+		fmt.Printf("No messages found for history sync anchor: %v\n", err)
 		return
 	}
 
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+	chatJID, err := types.ParseJID(oldestChatJID)
+	if err != nil {
+		fmt.Printf("Failed to parse JID for history sync: %v\n", err)
 		return
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
+	msgInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chatJID,
+			IsFromMe: oldestIsFromMe,
+		},
+		ID:        oldestID,
+		Timestamp: oldestTimestamp,
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
+	_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
 	if err != nil {
 		fmt.Printf("Failed to request history sync: %v\n", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		fmt.Println("History sync requested.")
 	}
+}
+
+func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJIDStr string) error {
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	chatJID, err := types.ParseJID(chatJIDStr)
+	if err != nil {
+		return fmt.Errorf("invalid JID: %v", err)
+	}
+
+	// Check if we have any messages in this chat already
+	var oldestID string
+	var oldestTimestamp time.Time
+	var oldestIsFromMe bool
+
+	err = messageStore.db.QueryRow(`
+		SELECT id, timestamp, is_from_me
+		FROM messages
+		WHERE chat_jid = ?
+		ORDER BY timestamp ASC
+		LIMIT 1
+	`, chatJIDStr).Scan(&oldestID, &oldestTimestamp, &oldestIsFromMe)
+
+	if err == nil {
+		// We have messages, request more history before the oldest
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: oldestIsFromMe,
+			},
+			ID:        oldestID,
+			Timestamp: oldestTimestamp,
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send sync request: %v", err)
+		}
+		fmt.Printf("Requested on-demand sync for chat %s (before msg %s)\n", chatJIDStr, oldestID)
+	} else {
+		// No messages yet - create a synthetic anchor at "now" to get recent messages
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: false,
+			},
+			ID:        "FFFFFFFFFFFFFFFF",
+			Timestamp: time.Now(),
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send sync request: %v", err)
+		}
+		fmt.Printf("Requested on-demand sync for new chat %s\n", chatJIDStr)
+	}
+
+	// Also ensure the chat exists in our database with the contact name
+	contact, cerr := client.Store.Contacts.GetContact(context.Background(), chatJID)
+	if cerr == nil && contact.FullName != "" {
+		messageStore.StoreChat(chatJIDStr, contact.FullName, time.Now())
+		fmt.Printf("Stored chat entry for %s (%s)\n", chatJIDStr, contact.FullName)
+	}
+
+	return nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

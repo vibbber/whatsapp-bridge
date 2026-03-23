@@ -1,6 +1,6 @@
 # WhatsApp MCP Server
 
-This is a Model Context Protocol (MCP) server for WhatsApp.
+This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) with improved search and contact resolution.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
@@ -10,9 +10,25 @@ Here's an example of what you can do when it's connected to Claude.
 
 ![WhatsApp MCP](./example-use.png)
 
-> To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
-
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
+
+## Changes from upstream
+
+### Full address book search
+
+The upstream MCP only searches contacts that have been synced into the local `chats` table (typically a few hundred). This fork also searches the **full WhatsApp address book** stored by whatsmeow (often thousands of contacts), so you can find people you haven't recently messaged.
+
+### LID (Linked ID) resolution
+
+WhatsApp has been transitioning some contacts to use LID-based JIDs instead of phone-number-based JIDs. This fork resolves LIDs to real contact names using whatsmeow's `lid_map` table, so chats and messages from LID-based contacts show proper names instead of opaque numeric IDs.
+
+### Accent-insensitive search
+
+Searching for "Gotze" now finds "Götze", "Pinol" finds "Piñol", etc. All search operations normalize Unicode diacritics for comparison.
+
+### On-demand chat sync
+
+A new `/api/sync` endpoint on the Go bridge allows requesting history sync for specific chats. The bridge also sends presence on connect to help trigger pending sync data from WhatsApp.
 
 ## Installation
 
