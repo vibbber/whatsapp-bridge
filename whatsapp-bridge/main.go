@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
@@ -41,53 +42,58 @@ type Message struct {
 	Filename  string
 }
 
-// Database handler for storing message history
+// Database handler for storing message history.
+//
+// This store targets Postgres (Supabase) via DATABASE_URL — we refactored
+// the original SQLite schema to write into our project tables:
+//   whatsapp_chats, whatsapp_messages, whatsapp_media
+//
+// Column mapping from the upstream SQLite schema → our Postgres schema:
+//   chats.last_message_time  →  whatsapp_chats.last_message_at
+//   messages.id              →  whatsapp_messages.bridge_message_id
+//   messages.sender          →  whatsapp_messages.sender_jid
+//   messages.content         →  whatsapp_messages.text_content
+//   messages.media_type      →  whatsapp_messages.message_type (+ whatsapp_media.media_type)
+//   media blobs              →  whatsapp_media.(media_key|file_sha256|file_enc_sha256|file_length|url|filename)
 type MessageStore struct {
 	db *sql.DB
 }
 
-// Initialize message store
+// Initialize message store against Postgres (Supabase).
+// Requires DATABASE_URL to be set in the environment.
+// The schema is managed externally via Supabase migrations — no CREATE
+// TABLE statements here.
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return nil, fmt.Errorf("DATABASE_URL environment variable is required")
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open message database: %v", err)
+		return nil, fmt.Errorf("failed to open postgres database: %v", err)
 	}
 
-	// Create tables if they don't exist
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS chats (
-			jid TEXT PRIMARY KEY,
-			name TEXT,
-			last_message_time TIMESTAMP
-		);
-		
-		CREATE TABLE IF NOT EXISTS messages (
-			id TEXT,
-			chat_jid TEXT,
-			sender TEXT,
-			content TEXT,
-			timestamp TIMESTAMP,
-			is_from_me BOOLEAN,
-			media_type TEXT,
-			filename TEXT,
-			url TEXT,
-			media_key BLOB,
-			file_sha256 BLOB,
-			file_enc_sha256 BLOB,
-			file_length INTEGER,
-			PRIMARY KEY (id, chat_jid),
-			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-		);
-	`)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping postgres database: %v", err)
+	}
+
+	// Sanity-check that our tables exist — fail fast if the migration
+	// wasn't applied.
+	var n int
+	err = db.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.tables
+		 WHERE table_schema = 'public'
+		   AND table_name IN ('whatsapp_chats','whatsapp_messages','whatsapp_media')`,
+	).Scan(&n)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return nil, fmt.Errorf("failed to verify schema: %v", err)
+	}
+	if n != 3 {
+		db.Close()
+		return nil, fmt.Errorf("expected 3 whatsapp_* tables in public schema, found %d — run the Supabase migration first", n)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -98,16 +104,26 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database.
+// is_group is inferred from the JID server: "g.us" → group, else 1-on-1.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	isGroup := strings.HasSuffix(jid, "@g.us")
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		`INSERT INTO whatsapp_chats (jid, name, is_group, last_message_at, last_synced_at)
+		 VALUES ($1, $2, $3, $4, NOW())
+		 ON CONFLICT (jid) DO UPDATE SET
+		   name = EXCLUDED.name,
+		   is_group = EXCLUDED.is_group,
+		   last_message_at = GREATEST(COALESCE(whatsapp_chats.last_message_at, 'epoch'::timestamptz), EXCLUDED.last_message_at),
+		   last_synced_at = NOW()`,
+		jid, name, isGroup, lastMessageTime,
 	)
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database.
+// The upstream API passes `mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength`
+// on media messages — we write those into whatsapp_media as a separate row.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
@@ -115,19 +131,84 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
+	// Map the upstream `mediaType` into our `message_type` enum.
+	// The upstream uses "" for plain text, "image", "video", "audio", "document", etc.
+	messageType := "text"
+	if mediaType != "" {
+		messageType = mediaType
+	}
+	// Our CHECK constraint allows: text, image, video, audio, voice, document, sticker, location, contact, system, other
+	switch messageType {
+	case "text", "image", "video", "audio", "voice", "document", "sticker", "location", "contact", "system", "other":
+		// ok
+	default:
+		messageType = "other"
+	}
+
+	// Ensure the chat row exists first (FK constraint).
+	// Upstream usually calls StoreChat before StoreMessage, but defensively
+	// upsert a minimal chat row here in case of out-of-order inserts.
+	if _, err := store.db.Exec(
+		`INSERT INTO whatsapp_chats (jid, is_group, last_message_at, last_synced_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (jid) DO UPDATE SET
+		   last_message_at = GREATEST(COALESCE(whatsapp_chats.last_message_at, 'epoch'::timestamptz), EXCLUDED.last_message_at),
+		   last_synced_at = NOW()`,
+		chatJID, strings.HasSuffix(chatJID, "@g.us"), timestamp,
+	); err != nil {
+		return fmt.Errorf("failed to upsert chat row for message: %v", err)
+	}
+
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT INTO whatsapp_messages
+		   (bridge_message_id, chat_jid, sender_jid, is_from_me, timestamp, message_type, text_content)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (bridge_message_id) DO UPDATE SET
+		   text_content = EXCLUDED.text_content,
+		   message_type = EXCLUDED.message_type,
+		   timestamp = EXCLUDED.timestamp`,
+		id, chatJID, sender, isFromMe, timestamp, messageType, content,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to insert message: %v", err)
+	}
+
+	// Store media metadata if present
+	if mediaType != "" {
+		_, err := store.db.Exec(
+			`INSERT INTO whatsapp_media
+			   (bridge_message_id, chat_jid, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+			 ON CONFLICT (bridge_message_id, chat_jid) DO UPDATE SET
+			   media_type = EXCLUDED.media_type,
+			   filename = EXCLUDED.filename,
+			   url = COALESCE(NULLIF(EXCLUDED.url, ''), whatsapp_media.url),
+			   media_key = COALESCE(EXCLUDED.media_key, whatsapp_media.media_key),
+			   file_sha256 = COALESCE(EXCLUDED.file_sha256, whatsapp_media.file_sha256),
+			   file_enc_sha256 = COALESCE(EXCLUDED.file_enc_sha256, whatsapp_media.file_enc_sha256),
+			   file_length = CASE WHEN EXCLUDED.file_length > 0 THEN EXCLUDED.file_length ELSE whatsapp_media.file_length END,
+			   updated_at = NOW()`,
+			id, chatJID, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, int64(fileLength),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert media metadata: %v", err)
+		}
+	}
+
+	return nil
 }
 
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		`SELECT m.sender_jid, COALESCE(m.text_content, ''), m.timestamp, m.is_from_me,
+		        COALESCE(md.media_type, ''), COALESCE(md.filename, '')
+		 FROM whatsapp_messages m
+		 LEFT JOIN whatsapp_media md
+		   ON md.bridge_message_id = m.bridge_message_id AND md.chat_jid = m.chat_jid
+		 WHERE m.chat_jid = $1
+		 ORDER BY m.timestamp DESC
+		 LIMIT $2`,
 		chatJID, limit,
 	)
 	if err != nil {
@@ -152,7 +233,11 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+	rows, err := store.db.Query(
+		`SELECT jid, COALESCE(last_message_at, first_synced_at) AS last_message_at
+		 FROM whatsapp_chats
+		 ORDER BY last_message_at DESC NULLS LAST`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -484,27 +569,46 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
-// Store additional media info in the database
+// Store additional media info in the database.
+// Upserts into whatsapp_media; the parent message row must already exist.
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
-		"UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?",
-		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
+		`INSERT INTO whatsapp_media
+		   (bridge_message_id, chat_jid, url, media_key, file_sha256, file_enc_sha256, file_length, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+		 ON CONFLICT (bridge_message_id, chat_jid) DO UPDATE SET
+		   url = EXCLUDED.url,
+		   media_key = EXCLUDED.media_key,
+		   file_sha256 = EXCLUDED.file_sha256,
+		   file_enc_sha256 = EXCLUDED.file_enc_sha256,
+		   file_length = EXCLUDED.file_length,
+		   updated_at = NOW()`,
+		id, chatJID, url, mediaKey, fileSHA256, fileEncSHA256, int64(fileLength),
 	)
 	return err
 }
 
-// Get media info from the database
+// Get media info from the database.
+// Returns (mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err).
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
-	var mediaType, filename, url string
+	var mediaType, filename, url sql.NullString
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
-	var fileLength uint64
+	var fileLength sql.NullInt64
 
 	err := store.db.QueryRow(
-		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+		`SELECT COALESCE(md.media_type, ''),
+		        COALESCE(md.filename, ''),
+		        COALESCE(md.url, ''),
+		        md.media_key,
+		        md.file_sha256,
+		        md.file_enc_sha256,
+		        md.file_length
+		 FROM whatsapp_media md
+		 WHERE md.bridge_message_id = $1 AND md.chat_jid = $2`,
 		id, chatJID,
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
-	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+	return mediaType.String, filename.String, url.String, mediaKey, fileSHA256, fileEncSHA256, uint64(fileLength.Int64), err
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -571,7 +675,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	if err != nil {
 		// Try to get basic info if extended info isn't available
 		err = messageStore.db.QueryRow(
-			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
+			`SELECT COALESCE(md.media_type, ''), COALESCE(md.filename, '')
+			 FROM whatsapp_messages m
+			 LEFT JOIN whatsapp_media md
+			   ON md.bridge_message_id = m.bridge_message_id AND md.chat_jid = m.chat_jid
+			 WHERE m.bridge_message_id = $1 AND m.chat_jid = $2`,
 			messageID, chatJID,
 		).Scan(&mediaType, &filename)
 
@@ -822,8 +930,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server.
+	// Bind to 127.0.0.1 by default so the REST API is never exposed to
+	// the public internet. On Fly we use `fly ssh console` to hit it from
+	// within the machine, or Fly's private flycast network from other apps.
+	// Override with BIND_ADDR=0.0.0.0 only if you know what you're doing.
+	bindHost := os.Getenv("BIND_ADDR")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindHost, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -839,16 +955,19 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	// Create database connection for storing session data
+	// Create database connection for storing session data.
+	// whatsmeow's sqlstore supports Postgres natively — we point it at
+	// DATABASE_URL (Supabase Postgres) so the session is portable across
+	// Fly deploys and no persistent volume is needed.
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
+	sessionDSN := os.Getenv("DATABASE_URL")
+	if sessionDSN == "" {
+		logger.Errorf("DATABASE_URL environment variable is required")
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "postgres", sessionDSN, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -977,7 +1096,7 @@ func main() {
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	err := messageStore.db.QueryRow("SELECT COALESCE(name, '') FROM whatsapp_chats WHERE jid = $1", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
@@ -1224,8 +1343,8 @@ func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 	var oldestIsFromMe bool
 
 	err := messageStore.db.QueryRow(`
-		SELECT id, chat_jid, timestamp, is_from_me
-		FROM messages
+		SELECT bridge_message_id, chat_jid, timestamp, is_from_me
+		FROM whatsapp_messages
 		ORDER BY timestamp ASC
 		LIMIT 1
 	`).Scan(&oldestID, &oldestChatJID, &oldestTimestamp, &oldestIsFromMe)
@@ -1275,9 +1394,9 @@ func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJ
 	var oldestIsFromMe bool
 
 	err = messageStore.db.QueryRow(`
-		SELECT id, timestamp, is_from_me
-		FROM messages
-		WHERE chat_jid = ?
+		SELECT bridge_message_id, timestamp, is_from_me
+		FROM whatsapp_messages
+		WHERE chat_jid = $1
 		ORDER BY timestamp ASC
 		LIMIT 1
 	`, chatJIDStr).Scan(&oldestID, &oldestTimestamp, &oldestIsFromMe)

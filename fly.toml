@@ -1,0 +1,36 @@
+# Bamboo Valley WhatsApp Bridge — Fly.io config
+#
+# Purpose: always-on Go process that keeps a WhatsApp WebSocket open
+# and mirrors messages into Supabase Postgres.
+#
+# Secrets required (set via `fly secrets set`):
+#   DATABASE_URL — Supabase Postgres connection string
+#
+# App name and primary region are set on `fly launch`; edit here afterward
+# if you want to pin them in config.
+
+app = "bamboo-whatsapp-bridge"
+primary_region = "sin"  # Singapore — closest Fly region to Thailand
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BIND_ADDR = "127.0.0.1"
+  REST_PORT = "8080"
+
+# No [[services]] block — we're not exposing any HTTP ports to the Fly
+# public edge. This is a "worker" style app: it outbound-connects to
+# WhatsApp servers and to Supabase, but nothing should reach it from
+# the internet.
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"
+
+# Keep the machine running 24/7 — this is NOT a request-driven workload.
+# Auto-stop would drop the WhatsApp WebSocket and force re-pairing on resume.
+[[restart]]
+  policy = "always"
+  max_retries = 0  # always retry, no cap
